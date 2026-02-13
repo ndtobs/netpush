@@ -24,6 +24,7 @@ const (
 type Applier struct {
 	client *gnmi.Client
 	dryRun bool
+	prune  bool // If true, delete config not in YAML
 }
 
 // Config for applier
@@ -33,6 +34,7 @@ type Config struct {
 	Password string
 	Insecure bool
 	DryRun   bool
+	Prune    bool // If true, delete config not in YAML
 }
 
 // New creates a new applier
@@ -50,6 +52,7 @@ func New(cfg Config) (*Applier, error) {
 	return &Applier{
 		client: client,
 		dryRun: cfg.DryRun,
+		prune:  cfg.Prune,
 	}, nil
 }
 
@@ -190,7 +193,8 @@ type SyncResult struct {
 }
 
 // Sync compares local YAML to device state and applies minimal changes
-func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) (*SyncResult, error) {
+// If prune is true, deletes config on device that's not in YAML
+func (a *Applier) Sync(ctx context.Context, data map[string]interface{}, prune bool) (*SyncResult, error) {
 	result := &SyncResult{}
 
 	for feature, desired := range data {
@@ -216,7 +220,7 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) (*SyncR
 			continue
 		}
 
-		adds, updates, deletes := diffMaps(path, current, desiredMap)
+		adds, updates, deletes := diffMaps(path, current, desiredMap, prune)
 		result.Adds = append(result.Adds, adds...)
 		result.Updates = append(result.Updates, updates...)
 		result.Deletes = append(result.Deletes, deletes...)
@@ -277,7 +281,7 @@ func (a *Applier) SyncFile(ctx context.Context, path string) error {
 		return fmt.Errorf("load file: %w", err)
 	}
 
-	result, err := a.Sync(ctx, data)
+	result, err := a.Sync(ctx, data, a.prune)
 	if err != nil {
 		return err
 	}
@@ -311,7 +315,8 @@ func (a *Applier) SyncDir(ctx context.Context, dir string) error {
 }
 
 // diffMaps compares two maps and returns adds, updates, deletes
-func diffMaps(basePath string, current, desired map[string]interface{}) ([]*gnmi.Update, []*gnmi.Update, []string) {
+// Only returns deletes if prune is true
+func diffMaps(basePath string, current, desired map[string]interface{}, prune bool) ([]*gnmi.Update, []*gnmi.Update, []string) {
 	var adds, updates []*gnmi.Update
 	var deletes []string
 
@@ -336,10 +341,12 @@ func diffMaps(basePath string, current, desired map[string]interface{}) ([]*gnmi
 		}
 	}
 
-	// Find deletions
-	for key := range current {
-		if _, exists := desired[key]; !exists {
-			deletes = append(deletes, basePath+"/"+key)
+	// Only find deletions if prune mode enabled
+	if prune {
+		for key := range current {
+			if _, exists := desired[key]; !exists {
+				deletes = append(deletes, basePath+"/"+key)
+			}
 		}
 	}
 

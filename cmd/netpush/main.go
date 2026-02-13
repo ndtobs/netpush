@@ -40,6 +40,7 @@ func syncCmd() *cobra.Command {
 		password      string
 		insecure      bool
 		dryRun        bool
+		prune         bool
 		timeout       time.Duration
 	)
 
@@ -48,22 +49,20 @@ func syncCmd() *cobra.Command {
 		Short: "Sync config - diff and apply minimal changes",
 		Long: `Sync network configuration by comparing local YAML to device state.
 
-Computes the minimal set of changes needed:
-- Adds config that exists in YAML but not on device
-- Updates config that differs between YAML and device  
-- Deletes config that exists on device but not in YAML
+By default, sync is additive - it only adds/updates config from your YAML.
+Config on the device that's not in your YAML is left alone.
 
-This is the safest way to ensure device matches your YAML.
+With --prune, config on the device that's not in your YAML is deleted.
 
 Examples:
-  # Sync single device
+  # Sync single device (additive)
   netpush sync ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
 
   # Sync using inventory
   netpush sync ./ -i inventory.yaml
 
-  # Sync specific group
-  netpush sync ./ -i inventory.yaml --group leaf
+  # Sync with pruning (delete config not in YAML)
+  netpush sync ./ -i inventory.yaml --prune
 
   # Dry run - preview changes
   netpush sync ./ -i inventory.yaml --dry-run`,
@@ -72,14 +71,14 @@ Examples:
 			basePath := args[0]
 
 			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, timeout, "sync")
+				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, prune, timeout, "sync")
 			}
 
 			if target == "" {
 				return fmt.Errorf("either --target or --inventory required")
 			}
 
-			return runSingle(basePath, target, username, password, insecure, dryRun, timeout, "sync")
+			return runSingle(basePath, target, username, password, insecure, dryRun, prune, timeout, "sync")
 		},
 	}
 
@@ -90,6 +89,7 @@ Examples:
 	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
 	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would change without applying")
+	cmd.Flags().BoolVar(&prune, "prune", false, "delete config not in YAML (default: additive only)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
 
 	return cmd
@@ -134,14 +134,14 @@ Examples:
 			}
 
 			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, timeout, op)
+				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, false, timeout, op)
 			}
 
 			if target == "" {
 				return fmt.Errorf("either --target or --inventory required")
 			}
 
-			return runSingle(basePath, target, username, password, insecure, dryRun, timeout, op)
+			return runSingle(basePath, target, username, password, insecure, dryRun, false, timeout, op)
 		},
 	}
 
@@ -186,14 +186,14 @@ Examples:
 			basePath := args[0]
 
 			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, timeout, "delete")
+				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, false, timeout, "delete")
 			}
 
 			if target == "" {
 				return fmt.Errorf("either --target or --inventory required")
 			}
 
-			return runSingle(basePath, target, username, password, insecure, dryRun, timeout, "delete")
+			return runSingle(basePath, target, username, password, insecure, dryRun, false, timeout, "delete")
 		},
 	}
 
@@ -217,6 +217,7 @@ func diffCmd() *cobra.Command {
 		username      string
 		password      string
 		insecure      bool
+		prune         bool
 		timeout       time.Duration
 	)
 
@@ -226,23 +227,25 @@ func diffCmd() *cobra.Command {
 		Long: `Compare local YAML config with device's current config.
 
 Shows what would change if you ran 'sync'.
+Use --prune to also show what would be deleted.
 
 Examples:
   netpush diff ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
-  netpush diff ./ -i inventory.yaml`,
+  netpush diff ./ -i inventory.yaml
+  netpush diff ./ -i inventory.yaml --prune`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			basePath := args[0]
 
 			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, true, timeout, "diff")
+				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, true, prune, timeout, "diff")
 			}
 
 			if target == "" {
 				return fmt.Errorf("either --target or --inventory required")
 			}
 
-			return runSingle(basePath, target, username, password, insecure, true, timeout, "diff")
+			return runSingle(basePath, target, username, password, insecure, true, prune, timeout, "diff")
 		},
 	}
 
@@ -252,13 +255,14 @@ Examples:
 	cmd.Flags().StringVarP(&username, "username", "u", "", "gNMI username")
 	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
 	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
+	cmd.Flags().BoolVar(&prune, "prune", false, "show deletions (config not in YAML)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
 
 	return cmd
 }
 
 // runWithInventory runs operation against inventory hosts
-func runWithInventory(basePath, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration, op string) error {
+func runWithInventory(basePath, invFile, group, username, password string, insecure, dryRun, prune bool, timeout time.Duration, op string) error {
 	inv, err := inventory.Load(invFile)
 	if err != nil {
 		return fmt.Errorf("load inventory: %w", err)
@@ -301,7 +305,7 @@ func runWithInventory(basePath, invFile, group, username, password string, insec
 
 		fmt.Printf("\n=== %s (%s) ===\n", host, target)
 
-		if err := runSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, timeout, op); err != nil {
+		if err := runSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, prune, timeout, op); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			continue
 		}
@@ -329,7 +333,7 @@ func findHostConfig(basePath, host string) string {
 }
 
 // runSingle runs operation against a single target
-func runSingle(configPath, target, username, password string, insecure, dryRun bool, timeout time.Duration, op string) error {
+func runSingle(configPath, target, username, password string, insecure, dryRun, prune bool, timeout time.Duration, op string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -339,6 +343,7 @@ func runSingle(configPath, target, username, password string, insecure, dryRun b
 		Password: password,
 		Insecure: insecure,
 		DryRun:   dryRun,
+		Prune:    prune,
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
