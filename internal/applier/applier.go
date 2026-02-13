@@ -138,6 +138,24 @@ func (a *Applier) Apply(ctx context.Context, data map[string]interface{}, op Ope
 	return nil
 }
 
+// DeletePaths deletes specific OpenConfig paths
+func (a *Applier) DeletePaths(ctx context.Context, paths []string) error {
+	if a.dryRun {
+		fmt.Println("Dry run - would delete:")
+		for _, p := range paths {
+			fmt.Printf("  %s\n", p)
+		}
+		return nil
+	}
+
+	resp, err := a.client.Delete(ctx, paths)
+	if err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	fmt.Printf("Deleted %d paths (timestamp: %d)\n", len(paths), resp.Timestamp)
+	return nil
+}
+
 func (a *Applier) loadFile(path string) (map[string]interface{}, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

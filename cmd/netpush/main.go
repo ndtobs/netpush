@@ -166,30 +166,45 @@ func deleteCmd() *cobra.Command {
 		password      string
 		insecure      bool
 		dryRun        bool
+		paths         []string
 		timeout       time.Duration
 	)
 
 	cmd := &cobra.Command{
-		Use:   "delete <path>",
-		Short: "Delete config specified in YAML",
+		Use:   "delete [yaml-file]",
+		Short: "Delete config by path or YAML file",
 		Long: `Delete network configuration via gNMI.
 
-The YAML file specifies what paths to delete.
+Use --path to delete specific OpenConfig paths directly.
+Or provide a YAML file specifying what to delete.
 
 Examples:
-  # Delete from single device
+  # Delete specific path
+  netpush delete --path "bgp[default]/neighbors/neighbor[neighbor-address=10.0.0.1]" -t leaf1:6030 -u admin -P admin -k
+
+  # Delete multiple paths
+  netpush delete --path "interface[Ethernet5]" --path "interface[Ethernet6]" -t leaf1:6030 -u admin -P admin -k
+
+  # Delete from YAML file
   netpush delete ./remove-peer.yaml -t leaf1:6030 -u admin -P admin -k
 
   # Delete using inventory
-  netpush delete ./remove-peer.yaml -i inventory.yaml`,
-		Args: cobra.ExactArgs(1),
+  netpush delete --path "interface[Vlan99]" -i inventory.yaml`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDelete(args[0], target, inventoryFile, group, username, password, insecure, dryRun, timeout)
+			if len(paths) > 0 {
+				return runDeletePaths(paths, target, inventoryFile, group, username, password, insecure, dryRun, timeout)
+			}
+			if len(args) == 0 {
+				return fmt.Errorf("either --path or a YAML file required")
+			}
+			return runDeleteFile(args[0], target, inventoryFile, group, username, password, insecure, dryRun, timeout)
 		},
 	}
 
 	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview deletions without applying")
+	cmd.Flags().StringArrayVarP(&paths, "path", "p", nil, "OpenConfig path to delete (can be repeated)")
 
 	return cmd
 }
@@ -217,17 +232,80 @@ func run(basePath, target, invFile, group, username, password string, insecure, 
 	return runSingle(basePath, target, username, password, insecure, dryRun, prune, timeout)
 }
 
-// runDelete executes delete against targets
-func runDelete(basePath, target, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+// runDeleteFile executes delete from YAML file against targets
+func runDeleteFile(basePath, target, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
 	if invFile != "" {
-		return runDeleteWithInventory(basePath, invFile, group, username, password, insecure, dryRun, timeout)
+		return runDeleteFileWithInventory(basePath, invFile, group, username, password, insecure, dryRun, timeout)
 	}
 
 	if target == "" {
 		return fmt.Errorf("either --target or --inventory required")
 	}
 
-	return runDeleteSingle(basePath, target, username, password, insecure, dryRun, timeout)
+	return runDeleteFileSingle(basePath, target, username, password, insecure, dryRun, timeout)
+}
+
+// runDeletePaths deletes specific paths
+func runDeletePaths(paths []string, target, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	// Expand short paths
+	expandedPaths := make([]string, len(paths))
+	for i, p := range paths {
+		expandedPaths[i] = expandPath(p)
+	}
+
+	if invFile != "" {
+		return runDeletePathsWithInventory(expandedPaths, invFile, group, username, password, insecure, dryRun, timeout)
+	}
+
+	if target == "" {
+		return fmt.Errorf("either --target or --inventory required")
+	}
+
+	return runDeletePathsSingle(expandedPaths, target, username, password, insecure, dryRun, timeout)
+}
+
+// expandPath expands short path syntax to full OpenConfig paths
+func expandPath(path string) string {
+	// If already absolute, return as-is
+	if len(path) > 0 && path[0] == '/' {
+		return path
+	}
+
+	// Short path expansions (same as netsert)
+	expansions := map[string]string{
+		"bgp[":              "/network-instances/network-instance[name=%s]/protocols/protocol[identifier=BGP][name=BGP]/bgp/",
+		"interface[":        "/interfaces/interface[name=%s]/",
+		"system/":           "/system/",
+		"network-instance[": "/network-instances/network-instance[name=%s]/",
+	}
+
+	for prefix, template := range expansions {
+		if len(path) >= len(prefix) && path[:len(prefix)] == prefix {
+			// Extract the key and rest
+			rest := path[len(prefix):]
+			closeBracket := -1
+			for i, c := range rest {
+				if c == ']' {
+					closeBracket = i
+					break
+				}
+			}
+			if closeBracket > 0 {
+				key := rest[:closeBracket]
+				remainder := ""
+				if closeBracket+1 < len(rest) {
+					remainder = rest[closeBracket+1:]
+					if len(remainder) > 0 && remainder[0] == '/' {
+						remainder = remainder[1:]
+					}
+				}
+				return fmt.Sprintf(template, key) + remainder
+			}
+		}
+	}
+
+	// Fallback: add leading slash
+	return "/" + path
 }
 
 // runWithInventory runs operation against inventory hosts
@@ -266,8 +344,8 @@ func runWithInventory(basePath, invFile, group, username, password string, insec
 	return nil
 }
 
-// runDeleteWithInventory runs delete against inventory hosts
-func runDeleteWithInventory(basePath, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+// runDeleteFileWithInventory runs delete from YAML against inventory hosts
+func runDeleteFileWithInventory(basePath, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
 	inv, err := inventory.Load(invFile)
 	if err != nil {
 		return fmt.Errorf("load inventory: %w", err)
@@ -294,7 +372,42 @@ func runDeleteWithInventory(basePath, invFile, group, username, password string,
 		configPath := findHostConfig(basePath, host)
 		fmt.Printf("\n=== %s (%s) ===\n", host, target)
 
-		if err := runDeleteSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, timeout); err != nil {
+		if err := runDeleteFileSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, timeout); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// runDeletePathsWithInventory deletes paths against inventory hosts
+func runDeletePathsWithInventory(paths []string, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	inv, err := inventory.Load(invFile)
+	if err != nil {
+		return fmt.Errorf("load inventory: %w", err)
+	}
+
+	hosts := getHosts(inv, group)
+	if len(hosts) == 0 {
+		return fmt.Errorf("no hosts found")
+	}
+
+	for _, host := range hosts {
+		target := inv.ResolveHost(host)
+		hostUser, hostPass, hostInsecure := inv.GetHostCredentials(host)
+		if username != "" {
+			hostUser = username
+		}
+		if password != "" {
+			hostPass = password
+		}
+		if insecure {
+			hostInsecure = true
+		}
+
+		fmt.Printf("\n=== %s (%s) ===\n", host, target)
+
+		if err := runDeletePathsSingle(paths, target, hostUser, hostPass, hostInsecure, dryRun, timeout); err != nil {
 			fmt.Printf("Error: %v\n", err)
 		}
 	}
@@ -360,8 +473,8 @@ func runSingle(configPath, target, username, password string, insecure, dryRun, 
 	return app.SyncFile(ctx, configPath)
 }
 
-// runDeleteSingle runs delete against a single target
-func runDeleteSingle(configPath, target, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+// runDeleteFileSingle runs delete from YAML against a single target
+func runDeleteFileSingle(configPath, target, username, password string, insecure, dryRun bool, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -386,4 +499,24 @@ func runDeleteSingle(configPath, target, username, password string, insecure, dr
 		return app.ApplyDir(ctx, configPath, applier.OpDelete)
 	}
 	return app.ApplyFile(ctx, configPath, applier.OpDelete)
+}
+
+// runDeletePathsSingle deletes specific paths from a single target
+func runDeletePathsSingle(paths []string, target, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	app, err := applier.New(applier.Config{
+		Target:   target,
+		Username: username,
+		Password: password,
+		Insecure: insecure,
+		DryRun:   dryRun,
+	})
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer app.Close()
+
+	return app.DeletePaths(ctx, paths)
 }
