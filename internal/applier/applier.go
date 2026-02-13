@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ndtobs/netpush/internal/gnmi"
+	"github.com/ndtobs/netpush/internal/transform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -82,11 +84,31 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
 	updates := a.buildUpdates(data)
 
 	if a.dryRun {
-		fmt.Println("Dry run - would replace:")
+		// Compare each path to device state
+		hasChanges := false
 		for _, u := range updates {
-			fmt.Printf("  REPLACE: %s\n", u.Path)
+			current, err := a.client.GetJSON(ctx, u.Path)
+			if err != nil {
+				// Can't get current - assume it's a change
+				fmt.Printf("  REPLACE: %s (new or error getting current)\n", u.Path)
+				hasChanges = true
+				continue
+			}
+
+			desiredMap, ok := u.Value.(map[string]interface{})
+			if !ok {
+				fmt.Printf("  REPLACE: %s\n", u.Path)
+				hasChanges = true
+				continue
+			}
+
+			diff := diffConfig(current, desiredMap)
+			if diff != "" {
+				fmt.Printf("  REPLACE: %s\n%s", u.Path, diff)
+				hasChanges = true
+			}
 		}
-		if len(updates) == 0 {
+		if !hasChanges {
 			fmt.Println("  (no changes)")
 		}
 		return nil
@@ -209,9 +231,16 @@ func (a *Applier) buildUpdates(data map[string]interface{}) []*gnmi.Update {
 			continue
 		}
 
+		// Transform netmodel format to OpenConfig format
+		transformed, err := transform.ToOpenConfig(key, value)
+		if err != nil {
+			fmt.Printf("Warning: failed to transform %s: %v\n", key, err)
+			continue
+		}
+
 		updates = append(updates, &gnmi.Update{
 			Path:  path,
-			Value: value,
+			Value: transformed,
 		})
 	}
 
@@ -230,4 +259,76 @@ func featureToPath(feature string) string {
 	}
 
 	return paths[feature]
+}
+
+// diffConfig compares two configs and returns a human-readable diff
+func diffConfig(current, desired map[string]interface{}) string {
+	var sb strings.Builder
+
+	// Find additions and changes in desired
+	for key, desiredVal := range desired {
+		currentVal, exists := current[key]
+		if !exists {
+			sb.WriteString(fmt.Sprintf("    + %s\n", key))
+			continue
+		}
+
+		if !deepEqual(currentVal, desiredVal) {
+			sb.WriteString(fmt.Sprintf("    ~ %s\n", key))
+		}
+	}
+
+	// Find deletions (in current but not in desired)
+	for key := range current {
+		if _, exists := desired[key]; !exists {
+			sb.WriteString(fmt.Sprintf("    - %s\n", key))
+		}
+	}
+
+	return sb.String()
+}
+
+// deepEqual compares two values recursively
+func deepEqual(a, b interface{}) bool {
+	// Handle nil cases
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Both maps
+	aMap, aIsMap := a.(map[string]interface{})
+	bMap, bIsMap := b.(map[string]interface{})
+	if aIsMap && bIsMap {
+		if len(aMap) != len(bMap) {
+			return false
+		}
+		for k, av := range aMap {
+			bv, ok := bMap[k]
+			if !ok || !deepEqual(av, bv) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Both slices
+	aSlice, aIsSlice := a.([]interface{})
+	bSlice, bIsSlice := b.([]interface{})
+	if aIsSlice && bIsSlice {
+		if len(aSlice) != len(bSlice) {
+			return false
+		}
+		for i := range aSlice {
+			if !deepEqual(aSlice[i], bSlice[i]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Scalar comparison
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
