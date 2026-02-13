@@ -111,30 +111,25 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
 func (a *Applier) Diff(ctx context.Context, data map[string]interface{}) error {
 	updates := a.buildUpdates(data)
 
-	hasChanges := false
+	if len(updates) == 0 {
+		fmt.Println("  (nothing to compare)")
+		return nil
+	}
+
 	for _, u := range updates {
 		current, err := a.client.GetJSON(ctx, u.Path)
 		if err != nil {
-			fmt.Printf("  %s: (new or cannot read)\n", u.Path)
-			hasChanges = true
+			fmt.Printf("  %s: NEW (not on device)\n", u.Path)
 			continue
 		}
 
-		desiredMap, ok := u.Value.(map[string]interface{})
-		if !ok {
-			fmt.Printf("  %s: (type mismatch)\n", u.Path)
-			hasChanges = true
+		if current == nil {
+			fmt.Printf("  %s: NEW (path empty)\n", u.Path)
 			continue
 		}
 
-		diff := diffConfig(current, desiredMap)
-		if diff != "" {
-			fmt.Printf("  %s:\n%s", u.Path, diff)
-			hasChanges = true
-		}
-	}
-	if !hasChanges {
-		fmt.Println("  (no differences)")
+		// Path exists - config would be updated/replaced
+		fmt.Printf("  %s: EXISTS (would be replaced)\n", u.Path)
 	}
 	return nil
 }
@@ -301,8 +296,8 @@ func systemSubPaths(data map[string]interface{}) []*gnmi.Update {
 
 	if hostname, ok := data["hostname"]; ok {
 		updates = append(updates, &gnmi.Update{
-			Path:  "/system/config/hostname",
-			Value: hostname,
+			Path:  "/system/config",
+			Value: map[string]interface{}{"hostname": hostname},
 		})
 	}
 
@@ -335,11 +330,15 @@ func systemSubPaths(data map[string]interface{}) []*gnmi.Update {
 
 // diffConfig compares two configs and returns a human-readable diff
 func diffConfig(current, desired map[string]interface{}) string {
+	// Normalize both maps - strip module prefixes from keys
+	normCurrent := normalizeKeys(current)
+	normDesired := normalizeKeys(desired)
+
 	var sb strings.Builder
 
 	// Find additions and changes in desired
-	for key, desiredVal := range desired {
-		currentVal, exists := current[key]
+	for key, desiredVal := range normDesired {
+		currentVal, exists := normCurrent[key]
 		if !exists {
 			sb.WriteString(fmt.Sprintf("    + %s\n", key))
 			continue
@@ -351,13 +350,35 @@ func diffConfig(current, desired map[string]interface{}) string {
 	}
 
 	// Find deletions (in current but not in desired)
-	for key := range current {
-		if _, exists := desired[key]; !exists {
+	for key := range normCurrent {
+		if _, exists := normDesired[key]; !exists {
 			sb.WriteString(fmt.Sprintf("    - %s\n", key))
 		}
 	}
 
 	return sb.String()
+}
+
+// normalizeKeys strips OpenConfig module prefixes from keys
+func normalizeKeys(m map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range m {
+		// Strip prefix like "openconfig-interfaces:" or "openconfig-network-instance:"
+		key := k
+		if idx := strings.LastIndex(k, ":"); idx != -1 {
+			key = k[idx+1:]
+		}
+		// Convert kebab-case to snake_case for comparison
+		key = strings.ReplaceAll(key, "-", "_")
+		
+		// Recursively normalize nested maps
+		if nested, ok := v.(map[string]interface{}); ok {
+			result[key] = normalizeKeys(nested)
+		} else {
+			result[key] = v
+		}
+	}
+	return result
 }
 
 // deepEqual compares two values recursively
