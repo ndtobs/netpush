@@ -21,14 +21,58 @@ func main() {
 		Version: version,
 	}
 
-	rootCmd.AddCommand(syncCmd())
 	rootCmd.AddCommand(applyCmd())
-	rootCmd.AddCommand(deleteCmd())
+	rootCmd.AddCommand(syncCmd())
 	rootCmd.AddCommand(diffCmd())
+	rootCmd.AddCommand(deleteCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func applyCmd() *cobra.Command {
+	var (
+		target        string
+		inventoryFile string
+		group         string
+		username      string
+		password      string
+		insecure      bool
+		dryRun        bool
+		timeout       time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "apply <path>",
+		Short: "Apply config (additive merge, no deletions)",
+		Long: `Apply network configuration via gNMI.
+
+Computes diff and applies only additions and updates.
+Config on the device that's not in your YAML is left alone.
+This is the safe default for most use cases.
+
+Use 'sync' instead if you want full replacement (with deletions).
+
+Examples:
+  # Apply to single device
+  netpush apply ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
+
+  # Apply using inventory
+  netpush apply ./ -i inventory.yaml
+
+  # Preview changes first
+  netpush apply ./ -i inventory.yaml --dry-run`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(args[0], target, inventoryFile, group, username, password, insecure, dryRun, false, timeout)
+		},
+	}
+
+	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying")
+
+	return cmd
 }
 
 func syncCmd() *cobra.Command {
@@ -40,62 +84,41 @@ func syncCmd() *cobra.Command {
 		password      string
 		insecure      bool
 		dryRun        bool
-		prune         bool
 		timeout       time.Duration
 	)
 
 	cmd := &cobra.Command{
 		Use:   "sync <path>",
-		Short: "Sync config - diff and apply minimal changes",
-		Long: `Sync network configuration by comparing local YAML to device state.
+		Short: "Sync config (full replacement, includes deletions)",
+		Long: `Sync network configuration to exactly match your YAML.
 
-By default, sync is additive - it only adds/updates config from your YAML.
-Config on the device that's not in your YAML is left alone.
+Computes diff and applies additions, updates, AND deletions.
+Config on the device that's not in your YAML WILL BE DELETED.
 
-With --prune, config on the device that's not in your YAML is deleted.
+Use 'apply' instead if you only want additive changes.
 
 Examples:
-  # Sync single device (additive)
+  # Sync single device
   netpush sync ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
 
   # Sync using inventory
   netpush sync ./ -i inventory.yaml
 
-  # Sync with pruning (delete config not in YAML)
-  netpush sync ./ -i inventory.yaml --prune
-
-  # Dry run - preview changes
+  # Always preview first!
   netpush sync ./ -i inventory.yaml --dry-run`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			basePath := args[0]
-
-			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, prune, timeout, "sync")
-			}
-
-			if target == "" {
-				return fmt.Errorf("either --target or --inventory required")
-			}
-
-			return runSingle(basePath, target, username, password, insecure, dryRun, prune, timeout, "sync")
+			return run(args[0], target, inventoryFile, group, username, password, insecure, dryRun, true, timeout)
 		},
 	}
 
-	cmd.Flags().StringVarP(&target, "target", "t", "", "target device (host:port)")
-	cmd.Flags().StringVarP(&inventoryFile, "inventory", "i", "", "inventory file")
-	cmd.Flags().StringVarP(&group, "group", "g", "", "target group from inventory")
-	cmd.Flags().StringVarP(&username, "username", "u", "", "gNMI username")
-	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
-	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would change without applying")
-	cmd.Flags().BoolVar(&prune, "prune", false, "delete config not in YAML (default: additive only)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
+	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying")
 
 	return cmd
 }
 
-func applyCmd() *cobra.Command {
+func diffCmd() *cobra.Command {
 	var (
 		target        string
 		inventoryFile string
@@ -103,57 +126,33 @@ func applyCmd() *cobra.Command {
 		username      string
 		password      string
 		insecure      bool
-		replace       bool
-		dryRun        bool
+		full          bool
 		timeout       time.Duration
 	)
 
 	cmd := &cobra.Command{
-		Use:   "apply <path>",
-		Short: "Apply config (merge with existing)",
-		Long: `Apply network configuration via gNMI Set operations.
+		Use:   "diff <path>",
+		Short: "Show diff between YAML and device config",
+		Long: `Compare local YAML config with device's current config.
 
-Uses merge semantics - adds/updates config without removing existing.
-For declarative sync with deletions, use 'sync' instead.
+By default shows what 'apply' would do (additions and updates only).
+Use --full to show what 'sync' would do (including deletions).
 
 Examples:
-  # Apply to single device
-  netpush apply ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
+  # Show additive changes
+  netpush diff ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
 
-  # Apply using inventory  
-  netpush apply ./ -i inventory.yaml
-
-  # Apply with replace (full subtree replace)
-  netpush apply ./ -i inventory.yaml --replace`,
+  # Show full diff including deletions
+  netpush diff ./ -i inventory.yaml --full`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			basePath := args[0]
-			op := "apply"
-			if replace {
-				op = "replace"
-			}
-
-			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, false, timeout, op)
-			}
-
-			if target == "" {
-				return fmt.Errorf("either --target or --inventory required")
-			}
-
-			return runSingle(basePath, target, username, password, insecure, dryRun, false, timeout, op)
+			// diff is always dry-run
+			return run(args[0], target, inventoryFile, group, username, password, insecure, true, full, timeout)
 		},
 	}
 
-	cmd.Flags().StringVarP(&target, "target", "t", "", "target device (host:port)")
-	cmd.Flags().StringVarP(&inventoryFile, "inventory", "i", "", "inventory file")
-	cmd.Flags().StringVarP(&group, "group", "g", "", "target group from inventory")
-	cmd.Flags().StringVarP(&username, "username", "u", "", "gNMI username")
-	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
-	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
-	cmd.Flags().BoolVar(&replace, "replace", false, "replace instead of merge")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be applied without applying")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
+	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
+	cmd.Flags().BoolVar(&full, "full", false, "show deletions (what sync would do)")
 
 	return cmd
 }
@@ -173,123 +172,79 @@ func deleteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "delete <path>",
 		Short: "Delete config specified in YAML",
-		Long: `Delete network configuration via gNMI Set delete operations.
+		Long: `Delete network configuration via gNMI.
+
+The YAML file specifies what paths to delete.
 
 Examples:
   # Delete from single device
   netpush delete ./remove-peer.yaml -t leaf1:6030 -u admin -P admin -k
 
   # Delete using inventory
-  netpush delete ./remove-peer.yaml -i inventory.yaml --group leaf`,
+  netpush delete ./remove-peer.yaml -i inventory.yaml`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			basePath := args[0]
-
-			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, dryRun, false, timeout, "delete")
-			}
-
-			if target == "" {
-				return fmt.Errorf("either --target or --inventory required")
-			}
-
-			return runSingle(basePath, target, username, password, insecure, dryRun, false, timeout, "delete")
+			return runDelete(args[0], target, inventoryFile, group, username, password, insecure, dryRun, timeout)
 		},
 	}
 
-	cmd.Flags().StringVarP(&target, "target", "t", "", "target device (host:port)")
-	cmd.Flags().StringVarP(&inventoryFile, "inventory", "i", "", "inventory file")
-	cmd.Flags().StringVarP(&group, "group", "g", "", "target group from inventory")
-	cmd.Flags().StringVarP(&username, "username", "u", "", "gNMI username")
-	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
-	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be deleted without deleting")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
+	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview deletions without applying")
 
 	return cmd
 }
 
-func diffCmd() *cobra.Command {
-	var (
-		target        string
-		inventoryFile string
-		group         string
-		username      string
-		password      string
-		insecure      bool
-		prune         bool
-		timeout       time.Duration
-	)
+func addCommonFlags(cmd *cobra.Command, target, inventoryFile, group, username, password *string, insecure *bool, timeout *time.Duration) {
+	cmd.Flags().StringVarP(target, "target", "t", "", "target device (host:port)")
+	cmd.Flags().StringVarP(inventoryFile, "inventory", "i", "", "inventory file")
+	cmd.Flags().StringVarP(group, "group", "g", "", "target group from inventory")
+	cmd.Flags().StringVarP(username, "username", "u", "", "gNMI username")
+	cmd.Flags().StringVarP(password, "password", "P", "", "gNMI password")
+	cmd.Flags().BoolVarP(insecure, "insecure", "k", false, "skip TLS verification")
+	cmd.Flags().DurationVar(timeout, "timeout", 30*time.Second, "operation timeout")
+}
 
-	cmd := &cobra.Command{
-		Use:   "diff <path>",
-		Short: "Show diff between YAML and device config",
-		Long: `Compare local YAML config with device's current config.
-
-Shows what would change if you ran 'sync'.
-Use --prune to also show what would be deleted.
-
-Examples:
-  netpush diff ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
-  netpush diff ./ -i inventory.yaml
-  netpush diff ./ -i inventory.yaml --prune`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			basePath := args[0]
-
-			if inventoryFile != "" {
-				return runWithInventory(basePath, inventoryFile, group, username, password, insecure, true, prune, timeout, "diff")
-			}
-
-			if target == "" {
-				return fmt.Errorf("either --target or --inventory required")
-			}
-
-			return runSingle(basePath, target, username, password, insecure, true, prune, timeout, "diff")
-		},
+// run executes apply or sync against targets
+func run(basePath, target, invFile, group, username, password string, insecure, dryRun, prune bool, timeout time.Duration) error {
+	if invFile != "" {
+		return runWithInventory(basePath, invFile, group, username, password, insecure, dryRun, prune, timeout)
 	}
 
-	cmd.Flags().StringVarP(&target, "target", "t", "", "target device (host:port)")
-	cmd.Flags().StringVarP(&inventoryFile, "inventory", "i", "", "inventory file")
-	cmd.Flags().StringVarP(&group, "group", "g", "", "target group from inventory")
-	cmd.Flags().StringVarP(&username, "username", "u", "", "gNMI username")
-	cmd.Flags().StringVarP(&password, "password", "P", "", "gNMI password")
-	cmd.Flags().BoolVarP(&insecure, "insecure", "k", false, "skip TLS verification")
-	cmd.Flags().BoolVar(&prune, "prune", false, "show deletions (config not in YAML)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "operation timeout")
+	if target == "" {
+		return fmt.Errorf("either --target or --inventory required")
+	}
 
-	return cmd
+	return runSingle(basePath, target, username, password, insecure, dryRun, prune, timeout)
+}
+
+// runDelete executes delete against targets
+func runDelete(basePath, target, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	if invFile != "" {
+		return runDeleteWithInventory(basePath, invFile, group, username, password, insecure, dryRun, timeout)
+	}
+
+	if target == "" {
+		return fmt.Errorf("either --target or --inventory required")
+	}
+
+	return runDeleteSingle(basePath, target, username, password, insecure, dryRun, timeout)
 }
 
 // runWithInventory runs operation against inventory hosts
-func runWithInventory(basePath, invFile, group, username, password string, insecure, dryRun, prune bool, timeout time.Duration, op string) error {
+func runWithInventory(basePath, invFile, group, username, password string, insecure, dryRun, prune bool, timeout time.Duration) error {
 	inv, err := inventory.Load(invFile)
 	if err != nil {
 		return fmt.Errorf("load inventory: %w", err)
 	}
 
-	// Get target hosts
-	var hosts []string
-	if group != "" {
-		var ok bool
-		hosts, ok = inv.GetGroup(group)
-		if !ok {
-			return fmt.Errorf("group %q not found", group)
-		}
-	} else {
-		hosts, _ = inv.GetGroup("all")
-	}
-
+	hosts := getHosts(inv, group)
 	if len(hosts) == 0 {
 		return fmt.Errorf("no hosts found")
 	}
 
-	// Process each host
 	for _, host := range hosts {
 		target := inv.ResolveHost(host)
 		hostUser, hostPass, hostInsecure := inv.GetHostCredentials(host)
-
-		// CLI flags override inventory
 		if username != "" {
 			hostUser = username
 		}
@@ -300,18 +255,63 @@ func runWithInventory(basePath, invFile, group, username, password string, insec
 			hostInsecure = true
 		}
 
-		// Determine config path for this host
 		configPath := findHostConfig(basePath, host)
-
 		fmt.Printf("\n=== %s (%s) ===\n", host, target)
 
-		if err := runSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, prune, timeout, op); err != nil {
+		if err := runSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, prune, timeout); err != nil {
 			fmt.Printf("Error: %v\n", err)
-			continue
 		}
 	}
 
 	return nil
+}
+
+// runDeleteWithInventory runs delete against inventory hosts
+func runDeleteWithInventory(basePath, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	inv, err := inventory.Load(invFile)
+	if err != nil {
+		return fmt.Errorf("load inventory: %w", err)
+	}
+
+	hosts := getHosts(inv, group)
+	if len(hosts) == 0 {
+		return fmt.Errorf("no hosts found")
+	}
+
+	for _, host := range hosts {
+		target := inv.ResolveHost(host)
+		hostUser, hostPass, hostInsecure := inv.GetHostCredentials(host)
+		if username != "" {
+			hostUser = username
+		}
+		if password != "" {
+			hostPass = password
+		}
+		if insecure {
+			hostInsecure = true
+		}
+
+		configPath := findHostConfig(basePath, host)
+		fmt.Printf("\n=== %s (%s) ===\n", host, target)
+
+		if err := runDeleteSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, timeout); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+func getHosts(inv *inventory.Inventory, group string) []string {
+	if group != "" {
+		hosts, ok := inv.GetGroup(group)
+		if !ok {
+			return nil
+		}
+		return hosts
+	}
+	hosts, _ := inv.GetGroup("all")
+	return hosts
 }
 
 // findHostConfig finds the config path for a host
@@ -328,12 +328,11 @@ func findHostConfig(basePath, host string) string {
 		return groupVars
 	}
 
-	// Fallback to base path
 	return basePath
 }
 
-// runSingle runs operation against a single target
-func runSingle(configPath, target, username, password string, insecure, dryRun, prune bool, timeout time.Duration, op string) error {
+// runSingle runs sync against a single target
+func runSingle(configPath, target, username, password string, insecure, dryRun, prune bool, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -355,31 +354,36 @@ func runSingle(configPath, target, username, password string, insecure, dryRun, 
 		return err
 	}
 
-	switch op {
-	case "sync", "diff":
-		if info.IsDir() {
-			return app.SyncDir(ctx, configPath)
-		}
-		return app.SyncFile(ctx, configPath)
+	if info.IsDir() {
+		return app.SyncDir(ctx, configPath)
+	}
+	return app.SyncFile(ctx, configPath)
+}
 
-	case "apply":
-		if info.IsDir() {
-			return app.ApplyDir(ctx, configPath, applier.OpUpdate)
-		}
-		return app.ApplyFile(ctx, configPath, applier.OpUpdate)
+// runDeleteSingle runs delete against a single target
+func runDeleteSingle(configPath, target, username, password string, insecure, dryRun bool, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	case "replace":
-		if info.IsDir() {
-			return app.ApplyDir(ctx, configPath, applier.OpReplace)
-		}
-		return app.ApplyFile(ctx, configPath, applier.OpReplace)
+	app, err := applier.New(applier.Config{
+		Target:   target,
+		Username: username,
+		Password: password,
+		Insecure: insecure,
+		DryRun:   dryRun,
+	})
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer app.Close()
 
-	case "delete":
-		if info.IsDir() {
-			return app.ApplyDir(ctx, configPath, applier.OpDelete)
-		}
-		return app.ApplyFile(ctx, configPath, applier.OpDelete)
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return err
 	}
 
-	return fmt.Errorf("unknown operation: %s", op)
+	if info.IsDir() {
+		return app.ApplyDir(ctx, configPath, applier.OpDelete)
+	}
+	return app.ApplyFile(ctx, configPath, applier.OpDelete)
 }
