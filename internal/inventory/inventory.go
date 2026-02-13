@@ -132,3 +132,17 @@ func (inv *Inventory) ListGroups() []string {
 	}
 	return names
 }
+
+// GetHostGroups returns all groups that contain the given host
+func (inv *Inventory) GetHostGroups(host string) []string {
+	var groups []string
+	for groupName, members := range inv.Groups {
+		for _, member := range members {
+			if member == host {
+				groups = append(groups, groupName)
+				break
+			}
+		}
+	}
+	return groups
+}

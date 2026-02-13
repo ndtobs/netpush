@@ -23,7 +23,6 @@ func main() {
 	}
 
 	rootCmd.AddCommand(applyCmd())
-	rootCmd.AddCommand(syncCmd())
 	rootCmd.AddCommand(diffCmd())
 	rootCmd.AddCommand(deleteCmd())
 
@@ -59,7 +58,7 @@ Examples:
   # Apply using inventory
   netpush apply ./model/ -i inventory.yaml
 
-  # Preview changes
+  # Preview changes (same as diff)
   netpush apply ./model/ -i inventory.yaml --dry-run`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -68,51 +67,7 @@ Examples:
 	}
 
 	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying")
-
-	return cmd
-}
-
-func syncCmd() *cobra.Command {
-	var (
-		target        string
-		inventoryFile string
-		group         string
-		username      string
-		password      string
-		insecure      bool
-		dryRun        bool
-		timeout       time.Duration
-	)
-
-	cmd := &cobra.Command{
-		Use:   "sync <path>",
-		Short: "Sync config (replace, device matches YAML exactly)",
-		Long: `Sync network configuration via gNMI Replace.
-
-Makes device config match your YAML exactly for each feature.
-If something exists on the device but not in your YAML, it gets removed.
-
-To remove a BGP neighbor: delete it from YAML, run sync.
-To remove an interface: delete it from YAML, run sync.
-
-Examples:
-  # Sync single device
-  netpush sync ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
-
-  # Sync using inventory
-  netpush sync ./model/ -i inventory.yaml
-
-  # Always preview first!
-  netpush sync ./model/ -i inventory.yaml --dry-run`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(args[0], target, inventoryFile, group, username, password, insecure, dryRun, timeout, "sync")
-		},
-	}
-
-	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying (same as diff)")
 
 	return cmd
 }
@@ -130,10 +85,14 @@ func diffCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "diff <path>",
-		Short: "Show differences between YAML and device config",
-		Long: `Compare YAML config to device state and show differences.
+		Short: "Show what apply would change",
+		Long: `Compare YAML config to device state and show what apply would change.
 
-Shows what's different without making any changes.
+Shows additions and modifications without making any changes.
+
+Output:
+  + path: value       # would be added (not on device)
+  ~ path: old → new   # would be changed
 
 Examples:
   # Diff single device
@@ -204,7 +163,7 @@ func addCommonFlags(cmd *cobra.Command, target, inventoryFile, group, username, 
 	cmd.Flags().DurationVar(timeout, "timeout", 30*time.Second, "operation timeout")
 }
 
-// run executes apply or sync
+// run executes apply or diff
 func run(basePath, target, invFile, group, username, password string, insecure, dryRun bool, timeout time.Duration, op string) error {
 	if invFile != "" {
 		return runWithInventory(basePath, invFile, group, username, password, insecure, dryRun, timeout, op)
@@ -242,10 +201,11 @@ func runWithInventory(basePath, invFile, group, username, password string, insec
 			hostInsecure = true
 		}
 
-		configPath := findHostConfig(basePath, host)
+		hostGroups := inv.GetHostGroups(host)
+		configPaths := findHostConfigs(basePath, host, target, hostGroups)
 		fmt.Printf("\n=== %s (%s) ===\n", host, target)
 
-		if err := runSingle(configPath, target, hostUser, hostPass, hostInsecure, dryRun, timeout, op); err != nil {
+		if err := runMultiple(configPaths, target, hostUser, hostPass, hostInsecure, dryRun, timeout, op); err != nil {
 			fmt.Printf("Error: %v\n", err)
 		}
 	}
@@ -265,20 +225,132 @@ func getHosts(inv *inventory.Inventory, group string) []string {
 	return hosts
 }
 
-func findHostConfig(basePath, host string) string {
-	// Check for host_vars/<host>/
-	hostVars := filepath.Join(basePath, "host_vars", host)
-	if info, err := os.Stat(hostVars); err == nil && info.IsDir() {
-		return hostVars
+// findHostConfigs returns all config paths for a host (group_vars + host_vars)
+func findHostConfigs(basePath, host, target string, hostGroups []string) []string {
+	var paths []string
+
+	// Always include group_vars/all.yaml if it exists
+	allVars := filepath.Join(basePath, "group_vars", "all.yaml")
+	if _, err := os.Stat(allVars); err == nil {
+		paths = append(paths, allVars)
 	}
 
-	// Check for group_vars/ (common config)
+	// Include group_vars/<group>.yaml for each group the host belongs to
 	groupVars := filepath.Join(basePath, "group_vars")
 	if info, err := os.Stat(groupVars); err == nil && info.IsDir() {
-		return groupVars
+		for _, group := range hostGroups {
+			if group == "all" {
+				continue // already loaded all.yaml
+			}
+			for _, ext := range []string{".yaml", ".yml"} {
+				groupFile := filepath.Join(groupVars, group+ext)
+				if _, err := os.Stat(groupFile); err == nil {
+					paths = append(paths, groupFile)
+					break
+				}
+			}
+		}
 	}
 
-	return basePath
+	// Check for host_vars/<host>/ (inventory name)
+	hostVars := filepath.Join(basePath, "host_vars", host)
+	if info, err := os.Stat(hostVars); err == nil && info.IsDir() {
+		paths = append(paths, hostVars)
+		return paths
+	}
+
+	// Check for host_vars/<address>/ (resolved address without port)
+	addr := target
+	if idx := strings.LastIndex(target, ":"); idx != -1 {
+		addr = target[:idx]
+	}
+	if addr != host {
+		addrVars := filepath.Join(basePath, "host_vars", addr)
+		if info, err := os.Stat(addrVars); err == nil && info.IsDir() {
+			paths = append(paths, addrVars)
+			return paths
+		}
+	}
+
+	return paths
+}
+
+// runMultiple merges configs from multiple paths and runs the operation
+func runMultiple(configPaths []string, target, username, password string, insecure, dryRun bool, timeout time.Duration, op string) error {
+	if len(configPaths) == 0 {
+		return fmt.Errorf("no config paths found")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	app, err := applier.New(applier.Config{
+		Target:   target,
+		Username: username,
+		Password: password,
+		Insecure: insecure,
+	})
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer app.Close()
+
+	// Merge all configs (later paths override earlier ones - host_vars override group_vars)
+	// Uses deep merge so nested keys are merged, not replaced
+	merged := make(map[string]interface{})
+	for _, path := range configPaths {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			data, err := app.LoadDir(ctx, path)
+			if err != nil {
+				continue
+			}
+			deepMerge(merged, data)
+		} else {
+			data, err := app.LoadFile(ctx, path)
+			if err != nil {
+				continue
+			}
+			deepMerge(merged, data)
+		}
+	}
+
+	if len(merged) == 0 {
+		fmt.Println("No config found")
+		return nil
+	}
+
+	switch op {
+	case "apply":
+		if dryRun {
+			return app.Diff(ctx, merged)
+		}
+		return app.Apply(ctx, merged)
+	case "diff":
+		return app.Diff(ctx, merged)
+	}
+
+	return fmt.Errorf("unknown operation: %s", op)
+}
+
+// deepMerge merges src into dst, recursively merging nested maps
+func deepMerge(dst, src map[string]interface{}) {
+	for k, srcVal := range src {
+		if dstVal, exists := dst[k]; exists {
+			// Both exist - try to merge if both are maps
+			srcMap, srcIsMap := srcVal.(map[string]interface{})
+			dstMap, dstIsMap := dstVal.(map[string]interface{})
+			if srcIsMap && dstIsMap {
+				deepMerge(dstMap, srcMap)
+				continue
+			}
+		}
+		// Otherwise, src overwrites dst
+		dst[k] = srcVal
+	}
 }
 
 func runSingle(configPath, target, username, password string, insecure, dryRun bool, timeout time.Duration, op string) error {
@@ -290,7 +362,6 @@ func runSingle(configPath, target, username, password string, insecure, dryRun b
 		Username: username,
 		Password: password,
 		Insecure: insecure,
-		DryRun:   dryRun,
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -304,15 +375,17 @@ func runSingle(configPath, target, username, password string, insecure, dryRun b
 
 	switch op {
 	case "apply":
+		if dryRun {
+			// dry-run is just diff
+			if info.IsDir() {
+				return app.DiffDir(ctx, configPath)
+			}
+			return app.DiffFile(ctx, configPath)
+		}
 		if info.IsDir() {
 			return app.ApplyDir(ctx, configPath)
 		}
 		return app.ApplyFile(ctx, configPath)
-	case "sync":
-		if info.IsDir() {
-			return app.SyncDir(ctx, configPath)
-		}
-		return app.SyncFile(ctx, configPath)
 	case "diff":
 		if info.IsDir() {
 			return app.DiffDir(ctx, configPath)
