@@ -84,32 +84,12 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
 	updates := a.buildUpdates(data)
 
 	if a.dryRun {
-		// Compare each path to device state
-		hasChanges := false
+		fmt.Println("Would replace:")
 		for _, u := range updates {
-			current, err := a.client.GetJSON(ctx, u.Path)
-			if err != nil {
-				// Can't get current - assume it's a change
-				fmt.Printf("  REPLACE: %s (new or error getting current)\n", u.Path)
-				hasChanges = true
-				continue
-			}
-
-			desiredMap, ok := u.Value.(map[string]interface{})
-			if !ok {
-				fmt.Printf("  REPLACE: %s\n", u.Path)
-				hasChanges = true
-				continue
-			}
-
-			diff := diffConfig(current, desiredMap)
-			if diff != "" {
-				fmt.Printf("  REPLACE: %s\n%s", u.Path, diff)
-				hasChanges = true
-			}
+			fmt.Printf("  REPLACE: %s\n", u.Path)
 		}
-		if !hasChanges {
-			fmt.Println("  (no changes)")
+		if len(updates) == 0 {
+			fmt.Println("  (nothing to sync)")
 		}
 		return nil
 	}
@@ -125,6 +105,52 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
 	}
 	fmt.Printf("Replaced %d paths (timestamp: %d)\n", len(updates), resp.Timestamp)
 	return nil
+}
+
+// Diff compares YAML to device state and shows differences
+func (a *Applier) Diff(ctx context.Context, data map[string]interface{}) error {
+	updates := a.buildUpdates(data)
+
+	hasChanges := false
+	for _, u := range updates {
+		current, err := a.client.GetJSON(ctx, u.Path)
+		if err != nil {
+			fmt.Printf("  %s: (new or cannot read)\n", u.Path)
+			hasChanges = true
+			continue
+		}
+
+		desiredMap, ok := u.Value.(map[string]interface{})
+		if !ok {
+			fmt.Printf("  %s: (type mismatch)\n", u.Path)
+			hasChanges = true
+			continue
+		}
+
+		diff := diffConfig(current, desiredMap)
+		if diff != "" {
+			fmt.Printf("  %s:\n%s", u.Path, diff)
+			hasChanges = true
+		}
+	}
+	if !hasChanges {
+		fmt.Println("  (no differences)")
+	}
+	return nil
+}
+
+// DiffFile diffs config from a YAML file
+func (a *Applier) DiffFile(ctx context.Context, path string) error {
+	data, err := a.loadFile(path)
+	if err != nil {
+		return fmt.Errorf("load file: %w", err)
+	}
+	return a.Diff(ctx, data)
+}
+
+// DiffDir diffs config from all YAML files in a directory
+func (a *Applier) DiffDir(ctx context.Context, dir string) error {
+	return a.processDir(ctx, dir, a.Diff)
 }
 
 // Delete removes specific paths

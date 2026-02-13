@@ -24,6 +24,7 @@ func main() {
 
 	rootCmd.AddCommand(applyCmd())
 	rootCmd.AddCommand(syncCmd())
+	rootCmd.AddCommand(diffCmd())
 	rootCmd.AddCommand(deleteCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -112,6 +113,41 @@ Examples:
 
 	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without applying")
+
+	return cmd
+}
+
+func diffCmd() *cobra.Command {
+	var (
+		target        string
+		inventoryFile string
+		group         string
+		username      string
+		password      string
+		insecure      bool
+		timeout       time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "diff <path>",
+		Short: "Show differences between YAML and device config",
+		Long: `Compare YAML config to device state and show differences.
+
+Shows what's different without making any changes.
+
+Examples:
+  # Diff single device
+  netpush diff ./host_vars/leaf1/ -t leaf1:6030 -u admin -P admin -k
+
+  # Diff using inventory
+  netpush diff ./model/ -i inventory.yaml`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(args[0], target, inventoryFile, group, username, password, insecure, false, timeout, "diff")
+		},
+	}
+
+	addCommonFlags(cmd, &target, &inventoryFile, &group, &username, &password, &insecure, &timeout)
 
 	return cmd
 }
@@ -277,6 +313,11 @@ func runSingle(configPath, target, username, password string, insecure, dryRun b
 			return app.SyncDir(ctx, configPath)
 		}
 		return app.SyncFile(ctx, configPath)
+	case "diff":
+		if info.IsDir() {
+			return app.DiffDir(ctx, configPath)
+		}
+		return app.DiffFile(ctx, configPath)
 	}
 
 	return fmt.Errorf("unknown operation: %s", op)
