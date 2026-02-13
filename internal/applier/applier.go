@@ -11,20 +11,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Operation type for Set
-type Operation string
-
-const (
-	OpUpdate  Operation = "update"  // Merge with existing config
-	OpReplace Operation = "replace" // Replace entire subtree
-	OpDelete  Operation = "delete"  // Remove config
-)
-
 // Applier pushes config to devices via gNMI
 type Applier struct {
 	client *gnmi.Client
 	dryRun bool
-	prune  bool // If true, delete config not in YAML
 }
 
 // Config for applier
@@ -34,7 +24,6 @@ type Config struct {
 	Password string
 	Insecure bool
 	DryRun   bool
-	Prune    bool // If true, delete config not in YAML
 }
 
 // New creates a new applier
@@ -52,7 +41,6 @@ func New(cfg Config) (*Applier, error) {
 	return &Applier{
 		client: client,
 		dryRun: cfg.DryRun,
-		prune:  cfg.Prune,
 	}, nil
 }
 
@@ -61,18 +49,109 @@ func (a *Applier) Close() error {
 	return a.client.Close()
 }
 
-// ApplyFile applies config from a YAML file
-func (a *Applier) ApplyFile(ctx context.Context, path string, op Operation) error {
+// Apply merges config (gNMI Update - additive)
+func (a *Applier) Apply(ctx context.Context, data map[string]interface{}) error {
+	updates := a.buildUpdates(data)
+
+	if a.dryRun {
+		fmt.Println("Dry run - would merge:")
+		for _, u := range updates {
+			fmt.Printf("  UPDATE: %s\n", u.Path)
+		}
+		if len(updates) == 0 {
+			fmt.Println("  (no changes)")
+		}
+		return nil
+	}
+
+	if len(updates) == 0 {
+		fmt.Println("No changes to apply")
+		return nil
+	}
+
+	resp, err := a.client.Set(ctx, updates)
+	if err != nil {
+		return fmt.Errorf("set: %w", err)
+	}
+	fmt.Printf("Applied %d updates (timestamp: %d)\n", len(updates), resp.Timestamp)
+	return nil
+}
+
+// Sync replaces config (gNMI Replace - makes device match YAML exactly)
+func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
+	updates := a.buildUpdates(data)
+
+	if a.dryRun {
+		fmt.Println("Dry run - would replace:")
+		for _, u := range updates {
+			fmt.Printf("  REPLACE: %s\n", u.Path)
+		}
+		if len(updates) == 0 {
+			fmt.Println("  (no changes)")
+		}
+		return nil
+	}
+
+	if len(updates) == 0 {
+		fmt.Println("No config to sync")
+		return nil
+	}
+
+	resp, err := a.client.Replace(ctx, updates)
+	if err != nil {
+		return fmt.Errorf("replace: %w", err)
+	}
+	fmt.Printf("Replaced %d paths (timestamp: %d)\n", len(updates), resp.Timestamp)
+	return nil
+}
+
+// Delete removes specific paths
+func (a *Applier) Delete(ctx context.Context, paths []string) error {
+	if a.dryRun {
+		fmt.Println("Dry run - would delete:")
+		for _, p := range paths {
+			fmt.Printf("  DELETE: %s\n", p)
+		}
+		return nil
+	}
+
+	resp, err := a.client.Delete(ctx, paths)
+	if err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	fmt.Printf("Deleted %d paths (timestamp: %d)\n", len(paths), resp.Timestamp)
+	return nil
+}
+
+// ApplyFile applies (merges) config from a YAML file
+func (a *Applier) ApplyFile(ctx context.Context, path string) error {
 	data, err := a.loadFile(path)
 	if err != nil {
 		return fmt.Errorf("load file: %w", err)
 	}
-
-	return a.Apply(ctx, data, op)
+	return a.Apply(ctx, data)
 }
 
-// ApplyDir applies config from all YAML files in a directory
-func (a *Applier) ApplyDir(ctx context.Context, dir string, op Operation) error {
+// SyncFile syncs (replaces) config from a YAML file
+func (a *Applier) SyncFile(ctx context.Context, path string) error {
+	data, err := a.loadFile(path)
+	if err != nil {
+		return fmt.Errorf("load file: %w", err)
+	}
+	return a.Sync(ctx, data)
+}
+
+// ApplyDir applies (merges) config from all YAML files in a directory
+func (a *Applier) ApplyDir(ctx context.Context, dir string) error {
+	return a.processDir(ctx, dir, a.Apply)
+}
+
+// SyncDir syncs (replaces) config from all YAML files in a directory
+func (a *Applier) SyncDir(ctx context.Context, dir string) error {
+	return a.processDir(ctx, dir, a.Sync)
+}
+
+func (a *Applier) processDir(ctx context.Context, dir string, fn func(context.Context, map[string]interface{}) error) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read dir: %w", err)
@@ -88,71 +167,16 @@ func (a *Applier) ApplyDir(ctx context.Context, dir string, op Operation) error 
 		}
 
 		path := filepath.Join(dir, entry.Name())
-		if err := a.ApplyFile(ctx, path, op); err != nil {
-			return fmt.Errorf("apply %s: %w", entry.Name(), err)
-		}
-	}
-
-	return nil
-}
-
-// Apply pushes config data via gNMI
-func (a *Applier) Apply(ctx context.Context, data map[string]interface{}, op Operation) error {
-	updates := a.buildUpdates(data)
-
-	if a.dryRun {
-		fmt.Println("Dry run - would apply:")
-		for _, u := range updates {
-			fmt.Printf("  %s: %v\n", u.Path, u.Value)
-		}
-		return nil
-	}
-
-	switch op {
-	case OpUpdate:
-		resp, err := a.client.Set(ctx, updates)
+		data, err := a.loadFile(path)
 		if err != nil {
-			return fmt.Errorf("set: %w", err)
+			return fmt.Errorf("load %s: %w", entry.Name(), err)
 		}
-		fmt.Printf("Applied %d updates (timestamp: %d)\n", len(updates), resp.Timestamp)
 
-	case OpReplace:
-		resp, err := a.client.Replace(ctx, updates)
-		if err != nil {
-			return fmt.Errorf("replace: %w", err)
+		if err := fn(ctx, data); err != nil {
+			return fmt.Errorf("%s: %w", entry.Name(), err)
 		}
-		fmt.Printf("Replaced %d paths (timestamp: %d)\n", len(updates), resp.Timestamp)
-
-	case OpDelete:
-		var paths []string
-		for _, u := range updates {
-			paths = append(paths, u.Path)
-		}
-		resp, err := a.client.Delete(ctx, paths)
-		if err != nil {
-			return fmt.Errorf("delete: %w", err)
-		}
-		fmt.Printf("Deleted %d paths (timestamp: %d)\n", len(paths), resp.Timestamp)
 	}
 
-	return nil
-}
-
-// DeletePaths deletes specific OpenConfig paths
-func (a *Applier) DeletePaths(ctx context.Context, paths []string) error {
-	if a.dryRun {
-		fmt.Println("Dry run - would delete:")
-		for _, p := range paths {
-			fmt.Printf("  %s\n", p)
-		}
-		return nil
-	}
-
-	resp, err := a.client.Delete(ctx, paths)
-	if err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
-	fmt.Printf("Deleted %d paths (timestamp: %d)\n", len(paths), resp.Timestamp)
 	return nil
 }
 
@@ -175,6 +199,11 @@ func (a *Applier) buildUpdates(data map[string]interface{}) []*gnmi.Update {
 	var updates []*gnmi.Update
 
 	for key, value := range data {
+		// Skip metadata
+		if key == "metadata" {
+			continue
+		}
+
 		path := featureToPath(key)
 		if path == "" {
 			continue
@@ -201,178 +230,4 @@ func featureToPath(feature string) string {
 	}
 
 	return paths[feature]
-}
-
-// SyncResult contains the diff analysis
-type SyncResult struct {
-	Adds    []*gnmi.Update // New config to add
-	Updates []*gnmi.Update // Changed config to update
-	Deletes []string       // Paths to delete
-}
-
-// Sync compares local YAML to device state and applies minimal changes
-// If prune is true, deletes config on device that's not in YAML
-func (a *Applier) Sync(ctx context.Context, data map[string]interface{}, prune bool) (*SyncResult, error) {
-	result := &SyncResult{}
-
-	for feature, desired := range data {
-		path := featureToPath(feature)
-		if path == "" {
-			continue
-		}
-
-		// Get current config from device
-		current, err := a.client.GetJSON(ctx, path)
-		if err != nil {
-			// Path doesn't exist = need to create
-			result.Adds = append(result.Adds, &gnmi.Update{
-				Path:  path,
-				Value: desired,
-			})
-			continue
-		}
-
-		// Compare and build diff
-		desiredMap, ok := desired.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		adds, updates, deletes := diffMaps(path, current, desiredMap, prune)
-		result.Adds = append(result.Adds, adds...)
-		result.Updates = append(result.Updates, updates...)
-		result.Deletes = append(result.Deletes, deletes...)
-	}
-
-	return result, nil
-}
-
-// ApplySync applies a sync result
-func (a *Applier) ApplySync(ctx context.Context, result *SyncResult) error {
-	if a.dryRun {
-		fmt.Println("Dry run - would apply:")
-		for _, add := range result.Adds {
-			fmt.Printf("  ADD: %s\n", add.Path)
-		}
-		for _, upd := range result.Updates {
-			fmt.Printf("  UPDATE: %s\n", upd.Path)
-		}
-		for _, del := range result.Deletes {
-			fmt.Printf("  DELETE: %s\n", del)
-		}
-		if len(result.Adds) == 0 && len(result.Updates) == 0 && len(result.Deletes) == 0 {
-			fmt.Println("  (no changes)")
-		}
-		return nil
-	}
-
-	// Apply deletes first
-	if len(result.Deletes) > 0 {
-		_, err := a.client.Delete(ctx, result.Deletes)
-		if err != nil {
-			return fmt.Errorf("delete: %w", err)
-		}
-		fmt.Printf("Deleted %d paths\n", len(result.Deletes))
-	}
-
-	// Apply adds/updates together
-	allUpdates := append(result.Adds, result.Updates...)
-	if len(allUpdates) > 0 {
-		_, err := a.client.Set(ctx, allUpdates)
-		if err != nil {
-			return fmt.Errorf("set: %w", err)
-		}
-		fmt.Printf("Applied %d adds, %d updates\n", len(result.Adds), len(result.Updates))
-	}
-
-	if len(result.Adds) == 0 && len(result.Updates) == 0 && len(result.Deletes) == 0 {
-		fmt.Println("No changes needed")
-	}
-
-	return nil
-}
-
-// SyncFile syncs config from a YAML file
-func (a *Applier) SyncFile(ctx context.Context, path string) error {
-	data, err := a.loadFile(path)
-	if err != nil {
-		return fmt.Errorf("load file: %w", err)
-	}
-
-	result, err := a.Sync(ctx, data, a.prune)
-	if err != nil {
-		return err
-	}
-
-	return a.ApplySync(ctx, result)
-}
-
-// SyncDir syncs config from all YAML files in a directory
-func (a *Applier) SyncDir(ctx context.Context, dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("read dir: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		ext := filepath.Ext(entry.Name())
-		if ext != ".yaml" && ext != ".yml" {
-			continue
-		}
-
-		path := filepath.Join(dir, entry.Name())
-		if err := a.SyncFile(ctx, path); err != nil {
-			return fmt.Errorf("sync %s: %w", entry.Name(), err)
-		}
-	}
-
-	return nil
-}
-
-// diffMaps compares two maps and returns adds, updates, deletes
-// Only returns deletes if prune is true
-func diffMaps(basePath string, current, desired map[string]interface{}, prune bool) ([]*gnmi.Update, []*gnmi.Update, []string) {
-	var adds, updates []*gnmi.Update
-	var deletes []string
-
-	// Find additions and updates
-	for key, desiredVal := range desired {
-		currentVal, exists := current[key]
-		if !exists {
-			// New key - add
-			adds = append(adds, &gnmi.Update{
-				Path:  basePath + "/" + key,
-				Value: desiredVal,
-			})
-			continue
-		}
-
-		// Check if value changed
-		if !deepEqual(currentVal, desiredVal) {
-			updates = append(updates, &gnmi.Update{
-				Path:  basePath + "/" + key,
-				Value: desiredVal,
-			})
-		}
-	}
-
-	// Only find deletions if prune mode enabled
-	if prune {
-		for key := range current {
-			if _, exists := desired[key]; !exists {
-				deletes = append(deletes, basePath+"/"+key)
-			}
-		}
-	}
-
-	return adds, updates, deletes
-}
-
-// deepEqual compares two values
-func deepEqual(a, b interface{}) bool {
-	// Simple comparison - could be enhanced
-	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
