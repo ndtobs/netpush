@@ -107,31 +107,56 @@ func (a *Applier) Sync(ctx context.Context, data map[string]interface{}) error {
 	return nil
 }
 
-// Diff compares YAML to device state and shows differences
+// Diff compares YAML to device state and shows differences  
 func (a *Applier) Diff(ctx context.Context, data map[string]interface{}) error {
 	updates := a.buildUpdates(data)
 
 	if len(updates) == 0 {
-		fmt.Println("  (nothing to compare)")
 		return nil
 	}
 
+	var newPaths []string
+	var existingPaths []string
+
 	for _, u := range updates {
 		current, err := a.client.GetJSON(ctx, u.Path)
-		if err != nil {
-			fmt.Printf("  %s: NEW (not on device)\n", u.Path)
-			continue
+		if err != nil || current == nil {
+			newPaths = append(newPaths, u.Path)
+		} else {
+			existingPaths = append(existingPaths, u.Path)
 		}
-
-		if current == nil {
-			fmt.Printf("  %s: NEW (path empty)\n", u.Path)
-			continue
-		}
-
-		// Path exists - config would be updated/replaced
-		fmt.Printf("  %s: EXISTS (would be replaced)\n", u.Path)
 	}
+
+	if len(newPaths) > 0 {
+		for _, p := range newPaths {
+			fmt.Printf("  + %s (new)\n", p)
+		}
+	}
+	
+	if len(existingPaths) > 0 && len(newPaths) == 0 {
+		fmt.Printf("  ✓ %d paths in sync\n", len(existingPaths))
+	} else if len(existingPaths) > 0 {
+		fmt.Printf("  ✓ %d paths exist\n", len(existingPaths))
+	}
+
 	return nil
+}
+
+// mapsEqual compares two maps after normalization
+func mapsEqual(a, b map[string]interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if !deepEqual(av, bv) {
+			return false
+		}
+	}
+	return true
 }
 
 // DiffFile diffs config from a YAML file
@@ -145,7 +170,36 @@ func (a *Applier) DiffFile(ctx context.Context, path string) error {
 
 // DiffDir diffs config from all YAML files in a directory
 func (a *Applier) DiffDir(ctx context.Context, dir string) error {
-	return a.processDir(ctx, dir, a.Diff)
+	// Collect all data from all YAML files
+	combined := make(map[string]interface{})
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		data, err := a.loadFile(path)
+		if err != nil {
+			continue
+		}
+
+		// Merge into combined
+		for k, v := range data {
+			combined[k] = v
+		}
+	}
+
+	return a.Diff(ctx, combined)
 }
 
 // Delete removes specific paths
