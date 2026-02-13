@@ -252,6 +252,14 @@ func (a *Applier) buildUpdates(data map[string]interface{}) []*gnmi.Update {
 			continue
 		}
 
+		// Handle system specially - can't replace entire /system
+		if key == "system" {
+			if sysData, ok := value.(map[string]interface{}); ok {
+				updates = append(updates, systemSubPaths(sysData)...)
+			}
+			continue
+		}
+
 		path := featureToPath(key)
 		if path == "" {
 			continue
@@ -279,12 +287,50 @@ func featureToPath(feature string) string {
 		"interfaces":     "/interfaces",
 		"bgp":            "/network-instances/network-instance[name=default]/protocols/protocol[identifier=BGP][name=BGP]/bgp",
 		"ospf":           "/network-instances/network-instance[name=default]/protocols/protocol[identifier=OSPF][name=OSPF]/ospfv2",
-		"system":         "/system",
 		"routing_policy": "/routing-policy",
 		"evpn":           "/network-instances/network-instance[name=default]/evpn",
 	}
 
 	return paths[feature]
+}
+
+// systemSubPaths returns the paths to update for system config
+// We can't replace /system as it contains operational state
+func systemSubPaths(data map[string]interface{}) []*gnmi.Update {
+	var updates []*gnmi.Update
+
+	if hostname, ok := data["hostname"]; ok {
+		updates = append(updates, &gnmi.Update{
+			Path:  "/system/config/hostname",
+			Value: hostname,
+		})
+	}
+
+	if aaa, ok := data["aaa"]; ok {
+		transformed, _ := transform.ToOpenConfig("aaa", aaa)
+		updates = append(updates, &gnmi.Update{
+			Path:  "/system/aaa",
+			Value: transformed,
+		})
+	}
+
+	if ntp, ok := data["ntp"]; ok {
+		transformed, _ := transform.ToOpenConfig("ntp", ntp)
+		updates = append(updates, &gnmi.Update{
+			Path:  "/system/ntp",
+			Value: transformed,
+		})
+	}
+
+	if dns, ok := data["dns"]; ok {
+		transformed, _ := transform.ToOpenConfig("dns", dns)
+		updates = append(updates, &gnmi.Update{
+			Path:  "/system/dns",
+			Value: transformed,
+		})
+	}
+
+	return updates
 }
 
 // diffConfig compares two configs and returns a human-readable diff
